@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, migration, partition, renumber, reserve, service, snapshot
+from . import bgpplan, migration, partition, provision, renumber, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
@@ -19,6 +19,8 @@ from .schemas import (
     AllocationItem,
     AllocationMigrationRequest,
     AllocationMigrationResponse,
+    AddressProvisionRequest,
+    AddressProvisionResponse,
     BatchReserveRequest,
     BatchReserveResponse,
     BgpAuditRequest,
@@ -55,7 +57,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "
@@ -66,7 +68,9 @@ app = FastAPI(
         "build RFC 2317 reverse-DNS delegation plans for current allocations, "
         "statelessly audit BGP announcements against AS relationships, "
         "record confirmable BGP announcement plans pinned to pool state, "
-        "and hand a pool's active plans over to a planned successor atomically."
+        "hand a pool's active plans over to a planned successor atomically, "
+        "and provision one subnet together with its BGP plan in a single "
+        "atomic submission."
     ),
     lifespan=lifespan,
 )
@@ -215,6 +219,27 @@ def migrate_pool_allocations(
 def allocate(pool_id: int, body: AllocateRequest) -> AllocationResponse:
     result = service.allocate(pool_id, body.request_id, body.prefix_length)
     return AllocationResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/provisions",
+    response_model=AddressProvisionResponse,
+    status_code=201,
+    tags=["provisioning"],
+)
+def provision_address(pool_id: int, body: AddressProvisionRequest, response: Response) -> AddressProvisionResponse:
+    result = provision.provision_address(
+        pool_id,
+        body.request_id,
+        body.prefix_length,
+        body.plan_id,
+        body.relationships,
+        body.announcements,
+        body.new_announcement,
+    )
+    # 201 for a newly committed provision, 200 for an idempotent replay.
+    response.status_code = 200 if result["replayed"] else 201
+    return AddressProvisionResponse(**result)
 
 
 @app.delete(

@@ -27,6 +27,12 @@
   按输入顺序为每项选取最小对齐空闲网段，每项必须完全落在 allow 段；命中 deny 或任一项无空间时
   **整批回滚、池不变**；成功后写入普通分配并返回输入顺序的映射（`batch_id` 幂等重放，
   已有 `request_id` 沿用原幂等语义）
+- 可**一次性开通**地址与 BGP 计划：同一请求给出池、`request_id`、`prefix_length`、`plan_id`、
+  AS 关系、覆盖现有分配的公告，以及只含 `id` 与 `as_path` 的新公告；服务在**同一个
+  SQLite 写事务**内选取起始地址最小的对齐空闲子网、以选中 CIDR 补全新公告前缀，再用现有
+  路径审计与计划覆盖规则校验**加入新分配后的全部**分配；成功才同时写入普通分配与 `planned`
+  计划，并固定提交后的池状态摘要。空间不足、公告无效或覆盖冲突时两者都不留下
+  （`plan_id` 幂等重放；已被其他操作占用的 `request_id` / `plan_id` 不能接管）
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -68,6 +74,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/exclusions` | 追加排除网段 |
 | `POST` | `/pools/{id}/renumber` | 整体改址：池整体平移到同前缀长度的新 CIDR，排除网段与分配按偏移一起平移（单写事务） |
 | `POST` | `/pools/{id}/allocations` | 按前缀长度申请子网（需带 `request_id`） |
+| `POST` | `/pools/{id}/provisions` | 一次性开通：单写事务内分配子网并创建配套 planned BGP 计划（`plan_id` 幂等） |
 | `POST` | `/pools/{id}/reservations` | 按策略批量预留子网：单写事务、整批回滚（`batch_id` 幂等） |
 | `DELETE` | `/pools/{id}/allocations/{request_id}` | 释放子网 |
 | `POST` | `/pools/{id}/reverse-dns-plan` | 为当前分配生成 RFC 2317 反向 DNS 委派（只读） |
@@ -966,6 +973,131 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 - 并发提交不同批次由写事务串行化，不会选中同一块空间；并发使用同一 `batch_id`
   时恰好记录一批，其余请求重放原结果。
 
+### 17. 一次性开通地址 + BGP 公告计划（单写事务，同成同败）
+
+`POST /pools/{id}/provisions` 把"申请一个子网"与"为新子网存一份配套 BGP 公告计划"
+合并为**一次原子提交**。调用方在同一请求体中给出：
+
+- `request_id` / `prefix_length`：普通子网申请参数；
+- `plan_id`：配套 BGP 计划的幂等键；
+- `relationships`：AS 关系，格式与 `/bgp/announcements/audit`、`/bgp-plans` 完全一致；
+- `announcements`：覆盖池内**当前已有分配**的公告列表（新池首次开通时可为空数组）；
+- `new_announcement`：**只给 `id` 与 `as_path`，不给 `prefix`**——服务用选中的新
+  子网 CIDR 自动补全其前缀。
+
+服务在**同一个 `BEGIN IMMEDIATE` 写事务**内依次完成：
+
+1. **重放/接管判定**：本接口已存的 `plan_id`，参数完全一致时重放原结果；参数（池、
+   `request_id`、`prefix_length`、AS 关系、公告集合或新公告路径，顺序无关）变化返回
+   `409 provision_id_conflict`。`plan_id` 若已被**单独计划创建接口**或另一次开通占用、
+   `request_id` 若已被**任何普通分配**（单笔分配、批量预留、另一次开通）占用，均返回 409
+   且**不能接管**（`bgp_plan_id_conflict` / `request_id_conflict`）；
+2. 与单笔分配完全相同的选址规则：在池减去排除网段与既有分配后的空闲空间中，选取
+   **起始地址最小的对齐空闲子网**；无空间返回 `409 pool_exhausted`；
+3. 以选中 CIDR 补全 `new_announcement.prefix`，把它与 `announcements` 合并为完整公告集，
+   复用现有无状态 AS 路径审计（关系冲突、未知关系边、空路径、公告 id 与现有公告重复等
+   照旧 422）；
+4. 先写入普通分配，再按现有计划覆盖规则校验**变更后的全部分配**：每条公告前缀完全位于
+   池内且不碰排除网段、每个分配（含刚插入的新分配）至少被一条 `valid` 公告覆盖、
+   同一分配只有单一起源（`bgp_announcement_outside_pool` /
+   `bgp_announcement_overlaps_exclusion` / `bgp_allocation_uncovered` /
+   `bgp_allocation_origin_conflict`，均为 422）；
+5. 全部通过后，在同一事务内写入**普通分配**（对状态查询、快照、反向 DNS、释放等全部
+   接口可见）、状态为 `planned` 的**不可变 BGP 计划**（其池状态摘要固定为**提交后**状态，
+   含新分配，与单独创建的计划结构完全相同），以及把二者绑定的开通记录，然后提交。
+
+任一步失败——空间不足、新公告审计不通过、覆盖/起源冲突、键被占用——事务整体回滚，
+**普通分配与计划都不留下，两个幂等键也不被占用**，修正请求后可原样重试。
+
+```bash
+curl -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-2026-10-04",
+    "prefix_length": 25,
+    "plan_id": "release-2026-10-04",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10,  "provider": 100},
+      {"type": "peer",               "a": 100, "b": 50},
+      {"type": "customer_provider", "customer": 60,  "provider": 50}
+    ],
+    "announcements": [
+      {"id": "cur-0", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+    ],
+    "new_announcement": {"id": "cur-128", "as_path": [100, 50, 60]}
+  }'
+```
+
+```json
+{
+  "pool_id": 1,
+  "allocation": {
+    "id": 2,
+    "pool_id": 1,
+    "cidr": "203.0.113.128/25",
+    "request_id": "order-2026-10-04",
+    "prefix_length": 25,
+    "created_at": "2026-10-04T09:00:00+00:00",
+    "replayed": false
+  },
+  "plan": {
+    "plan_id": "release-2026-10-04",
+    "pool_id": 1,
+    "status": "planned",
+    "results": [
+      {"id": "cur-0",   "prefix": "203.0.113.0/25",   "as_path": [10, 100],
+       "origin": 100, "status": "valid", "flags": [], "violating_hop": null},
+      {"id": "cur-128", "prefix": "203.0.113.128/25", "as_path": [100, 50, 60],
+       "origin": 60,  "status": "valid", "flags": [], "violating_hop": null}
+    ],
+    "state_digest": "8f2c...e1",
+    "pool_state": {
+      "cidr": "203.0.113.0/24",
+      "exclusions": [],
+      "allocations": [
+        {"cidr": "203.0.113.0/25",   "request_id": "order-prev", "prefix_length": 25, "created_at": "..."},
+        {"cidr": "203.0.113.128/25", "request_id": "order-2026-10-04", "prefix_length": 25, "created_at": "..."}
+      ]
+    },
+    "created_at": "2026-10-04T09:00:00+00:00",
+    "activated_at": null,
+    "replayed": false
+  },
+  "new_announcement": {
+    "id": "cur-128",
+    "prefix": "203.0.113.128/25",
+    "as_path": [100, 50, 60],
+    "origin": 60,
+    "status": "valid",
+    "flags": [],
+    "violating_hop": null
+  },
+  "created_at": "2026-10-04T09:00:00+00:00",
+  "replayed": false
+}
+```
+
+`new_announcement` 回显的是服务补全后的审计结果：`prefix` 即选中 CIDR，`as_path` 为
+折叠后的路径，另含 `origin`、`status`、`flags` 与 `violating_hop`。`plan.pool_state`
+固定的是**提交后**池状态（包含新分配），因此紧接着调用激活接口即可成功；开通后若池又
+发生变化，激活仍按现有规则返回 `409 bgp_plan_state_conflict`。
+
+**幂等与接管语义**：
+
+- 相同 `plan_id` + 相同请求参数（AS 关系去重排序、公告按 id 排序，与书写顺序无关）
+  重试：返回原始分配与计划（HTTP 200，各级 `replayed: true`），不会二次分配或重复建计划；
+  计划若已被单独激活/交接，重放返回其**当前** `active` / `retired` 状态；
+- 相同 `plan_id` 但任何参数变化：`409 provision_id_conflict`；
+- `request_id` 已被单笔分配、批量预留或另一次开通占用：`409 request_id_conflict`，
+  不会复用该分配，也不会留下计划；
+- `plan_id` 已被单独创建的 BGP 计划（含已激活/已退役的）或另一次开通占用：
+  `409 bgp_plan_id_conflict`，不会留下分配。
+
+**与既有接口的关系**：单独分配（`POST /pools/{id}/allocations`）、单独计划创建
+（`POST /pools/{id}/bgp-plans`）与激活/交接接口全部继续可用。开通产生的计划就是一条普通
+`bgp_plans` 记录，可被单独激活，也可作为交接的接班计划或旧计划参与 handover；其激活仍在
+独立写事务内重新核对**最新池状态**，池已漂移时同样拒绝。并发开通由 `BEGIN IMMEDIATE`
+串行化，`allocations.request_id` 唯一约束与 `bgp_plans.plan_id` 主键构成最后防线。
+
 ## 错误响应
 
 统一格式：
@@ -1041,6 +1173,7 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 | 422 | `bgp_handover_invalid` | 交接请求形状非法：清单重复或接班计划同时列入旧清单 |
 | 409 | `batch_id_conflict` | 同一 `batch_id` 以不同参数（池、规则或预留项）重放 |
 | 409 | `reservation_denied` | 批内某项选中的最小空闲网段未完全落在 allow 段内（整批回滚） |
+| 409 | `provision_id_conflict` | 一次性开通的 `plan_id` 曾以不同参数（池、request_id、prefix_length、关系或公告）提交 |
 | 422 | `bgp_announcement_outside_pool` | 公告前缀不完全位于地址池内 |
 | 422 | `bgp_announcement_overlaps_exclusion` | 公告前缀与池的排除网段重叠 |
 | 422 | `bgp_allocation_uncovered` | 存在当前分配未被任何审计通过的公告覆盖 |
@@ -1090,6 +1223,12 @@ curl -X POST http://localhost:8000/pools/1/reservations \
   与其他池重叠校验、逐条偏移平移、池内包含与互不冲突复验、池/排除/分配 CIDR 更新）
   都在单个 `BEGIN IMMEDIATE` 写事务内完成：并发改址与其他写操作串行化，任一检查失败
   或写入异常都整体回滚，**池与全部记录保持原样**；改址本身不另写历史记录表。
+- **一次性开通**的全部工作（重放/接管判定、最低对齐选址、新公告补全与全量路径审计、
+  加入新分配后的覆盖/单一起源校验、普通分配写入、planned 计划写入与二者绑定记录）都在
+  单个 `BEGIN IMMEDIATE` 写事务内完成：并发开通被串行化，不会选中同一块空间；空间不足、
+  公告无效或覆盖冲突时整体回滚，**普通分配与计划都不留下、两个幂等键都不被占用**；
+  `allocations.request_id` 唯一约束、`bgp_plans.plan_id` 主键与 `address_provisions`
+  绑定记录共同保证同一组键并发/重放只真正开通一次。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -1103,6 +1242,7 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 │   ├── migration.py   # 已分配子网跨池迁移：单写事务固定两池、保留行身份，operation_id 幂等
 │   ├── renumber.py    # 地址池整体改址：单写事务按池起点偏移平移排除网段与分配，保留行身份
 │   ├── reserve.py     # 按策略批量预留：单写事务编译规则+一致快照+按序选取，batch_id 幂等
+│   ├── provision.py   # 一次性开通：单写事务选址+补全公告+审计覆盖校验，同时写普通分配与 planned 计划，plan_id 幂等
 │   ├── db.py          # SQLite 连接、建表、事务管理
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
 │   ├── cidrpolicy.py  # CIDR 策略编译：首条匹配规则 -> 不重叠动作分段（仅同级同动作合并）

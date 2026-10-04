@@ -180,6 +180,25 @@ def init_db() -> None:
                 created_at       TEXT    NOT NULL
             );
 
+            -- One row per completed one-shot address provisioning.  Ties the
+            -- regular allocation to the BGP announcement plan stored together
+            -- with it in a single write transaction.  plan_id is both the
+            -- idempotency key of the provision and an FK to the bgp_plans row
+            -- it created, so a plan_id taken by a standalone plan (or by a
+            -- previous provision) cannot be taken over here.  Deleting any of
+            -- the linked rows (the plan, the allocation or the pool) cascades
+            -- the provision record away.
+            CREATE TABLE IF NOT EXISTS address_provisions (
+                plan_id        TEXT    PRIMARY KEY
+                                  REFERENCES bgp_plans(plan_id) ON DELETE CASCADE,
+                pool_id        INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                allocation_id  INTEGER NOT NULL REFERENCES allocations(id) ON DELETE CASCADE,
+                request_id     TEXT    NOT NULL,
+                params         TEXT    NOT NULL,
+                result         TEXT    NOT NULL,
+                created_at     TEXT    NOT NULL
+            );
+
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);
@@ -187,6 +206,9 @@ def init_db() -> None:
                 ON exclusions(pool_id);
             CREATE INDEX IF NOT EXISTS idx_bgp_plans_pool
                 ON bgp_plans(pool_id);
+            -- Fast takeover lookup by request_id for one-shot provisions.
+            CREATE INDEX IF NOT EXISTS idx_address_provisions_request
+                ON address_provisions(request_id);
             """
         )
 

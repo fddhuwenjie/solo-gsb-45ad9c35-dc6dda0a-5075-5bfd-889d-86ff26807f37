@@ -640,3 +640,71 @@ class BgpPlanHandoverResponse(BaseModel):
             "followed by the activated successor plan"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# One-shot address provisioning with a BGP plan
+# ---------------------------------------------------------------------------
+
+
+class NewBgpAnnouncementRequest(BaseModel):
+    """The announcement for the newly allocated subnet.
+
+    The service completes ``prefix`` itself with the chosen allocation CIDR;
+    the caller only supplies the id and the AS path.
+    """
+
+    id: str = Field(..., min_length=1, description="Unique id within the announcement set")
+    as_path: list[Asn] = Field(
+        ...,
+        min_length=1,
+        description="ASNs from the vantage point toward the origin",
+    )
+
+
+class AddressProvisionRequest(BaseModel):
+    request_id: str = Field(
+        ..., min_length=1, description="Client-generated idempotency key for the allocation"
+    )
+    prefix_length: int = Field(..., ge=0, le=32)
+    plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the BGP plan",
+    )
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description="AS relationships used to audit every announcement path",
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        default_factory=list,
+        description=(
+            "Announcements covering the pool's current allocations; the "
+            "newly allocated subnet is covered by new_announcement"
+        ),
+    )
+    new_announcement: NewBgpAnnouncementRequest
+
+
+class NewBgpAnnouncementResponse(BgpAuditResult):
+    """Audit result for the server-completed announcement."""
+
+
+class AddressProvisionResponse(BaseModel):
+    pool_id: int
+    allocation: AllocationResponse
+    plan: BgpPlanResponse = Field(
+        ..., description="The 'planned' BGP plan created in the same transaction"
+    )
+    new_announcement: NewBgpAnnouncementResponse = Field(
+        ...,
+        description=(
+            "The new announcement after prefix completion: id, chosen CIDR, "
+            "folded as_path, origin and audit status"
+        ),
+    )
+    created_at: str
+    replayed: bool = Field(
+        ...,
+        description="True when a stored provision was returned instead of creating one",
+    )
