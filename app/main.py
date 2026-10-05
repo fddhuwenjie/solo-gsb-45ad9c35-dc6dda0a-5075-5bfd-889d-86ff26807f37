@@ -11,10 +11,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, migration, partition, renumber, reserve, service, snapshot
+from . import allocateplan, bgpplan, migration, partition, renumber, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
+    AllocationBgpPlanRequest,
+    AllocationBgpPlanResponse,
     AllocationResponse,
     AllocationItem,
     AllocationMigrationRequest,
@@ -55,7 +57,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "
@@ -138,6 +140,21 @@ def activate_bgp_plan(pool_id: int, plan_id: str) -> BgpPlanResponse:
 def handover_bgp_plans(pool_id: int, body: BgpPlanHandoverRequest) -> BgpPlanHandoverResponse:
     result = bgpplan.handover_bgp_plans(pool_id, body.old_plan_ids, body.new_plan_id)
     return BgpPlanHandoverResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/allocation-bgp-plan",
+    response_model=AllocationBgpPlanResponse,
+    status_code=201,
+    tags=["bgp"],
+)
+def allocate_with_bgp_plan(
+    pool_id: int, body: AllocationBgpPlanRequest, response: Response
+) -> AllocationBgpPlanResponse:
+    result = allocateplan.allocate_with_bgp_plan(pool_id, body)
+    # 201 for a fresh provisioning, 200 for an idempotent replay.
+    response.status_code = 200 if result["replayed"] else 201
+    return AllocationBgpPlanResponse(**result)
 
 
 @app.post("/pools", response_model=PoolResponse, status_code=201, tags=["pools"])

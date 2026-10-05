@@ -640,3 +640,74 @@ class BgpPlanHandoverResponse(BaseModel):
             "followed by the activated successor plan"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# One-shot address provisioning + BGP announcement plan
+# ---------------------------------------------------------------------------
+
+
+class NewBgpAnnouncementRequest(BaseModel):
+    """New announcement for the subnet the service is about to allocate.
+
+    The prefix is intentionally absent: the service completes it with the
+    selected CIDR before auditing.
+    """
+
+    id: str = Field(
+        ..., min_length=1, description="Unique id of the new announcement"
+    )
+    as_path: list[Asn] = Field(
+        ...,
+        min_length=1,
+        description="ASNs from the vantage point toward the origin",
+    )
+
+
+class AllocationBgpPlanRequest(BaseModel):
+    request_id: str = Field(
+        ..., min_length=1, description="Client-generated idempotency key for the allocation"
+    )
+    prefix_length: int = Field(..., ge=0, le=32)
+    plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the announcement plan",
+    )
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description="AS relationships used to audit every announcement path",
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        default_factory=list,
+        description=(
+            "Announcements covering the pool's current allocations; may be "
+            "empty only when this is the pool's first allocation"
+        ),
+    )
+    new_announcement: NewBgpAnnouncementRequest = Field(
+        ...,
+        description=(
+            "Announcement for the new allocation; only id and as_path are "
+            "submitted, the prefix is completed with the selected CIDR"
+        ),
+    )
+
+
+class AllocatedSubnetResponse(BaseModel):
+    id: int = Field(..., description="Row id of the ordinary allocation")
+    pool_id: int
+    cidr: str
+    request_id: str
+    prefix_length: int
+    created_at: str
+
+
+class AllocationBgpPlanResponse(BaseModel):
+    pool_id: int
+    allocation: AllocatedSubnetResponse
+    plan: BgpPlanResponse
+    replayed: bool = Field(
+        ...,
+        description="True when a stored submission was returned instead of provisioning",
+    )

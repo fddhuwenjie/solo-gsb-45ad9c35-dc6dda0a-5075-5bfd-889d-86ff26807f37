@@ -180,6 +180,22 @@ def init_db() -> None:
                 created_at       TEXT    NOT NULL
             );
 
+            -- One row per completed one-shot allocation-with-BGP-plan
+            -- submission.  request_id is the primary idempotency key (it
+            -- mirrors the globally UNIQUE allocations.request_id) and plan_id
+            -- carries a UNIQUE constraint so neither key can be taken over by
+            -- another submission; params is the canonical request fingerprint
+            -- used to detect conflicting retries and result stores the
+            -- original allocation for replay.
+            CREATE TABLE IF NOT EXISTS allocation_bgp_plan_requests (
+                request_id  TEXT    PRIMARY KEY,
+                plan_id     TEXT    NOT NULL UNIQUE,
+                pool_id     INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                params      TEXT    NOT NULL,
+                result      TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL
+            );
+
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);
@@ -187,6 +203,8 @@ def init_db() -> None:
                 ON exclusions(pool_id);
             CREATE INDEX IF NOT EXISTS idx_bgp_plans_pool
                 ON bgp_plans(pool_id);
+            CREATE INDEX IF NOT EXISTS idx_allocation_bgp_plan_pool
+                ON allocation_bgp_plan_requests(pool_id);
             """
         )
 
